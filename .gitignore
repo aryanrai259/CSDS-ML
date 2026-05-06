@@ -1,0 +1,23 @@
+# Compiled python modules
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Model weights (Large files)
+*.h5
+*.onnx
+*.pt
+
+# Data / Logs
+logs/
+*.wav
+*.log
+
+# IDEs
+.vscode/
+.idea/
