@@ -1,40 +1,41 @@
 import os
-import sys
+import glob
 import numpy as np
-
-# Suppress TensorFlow logging to keep output clean
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 from tensorflow.keras import layers, models # type: ignore
 from sklearn.model_selection import train_test_split
 
-# Add src to python path for absolute imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+# Suppress TensorFlow logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-from src.inference.dataset import generate_mock_audio_dataset
-from src.dsp.filters import apply_bandpass, normalize_signal
-from src.dsp.extractors import generate_spectrogram
+PROCESSED_DIR = os.path.join("data", "processed")
 
-def preprocess_dataset(X_raw):
+class AudioDataGenerator(tf.keras.utils.Sequence):
     """
-    Passes the raw audio through the exact same DSP pipeline used in Phase 1.
-    This guarantees that the ML model is trained on the same math it will see in live inference.
+    Keras Data Generator. Instead of loading 4GB of audio into RAM,
+    this reads the pre-processed .npy Spectrogram files batch-by-batch
+    during training. This prevents Out-Of-Memory (OOM) crashes.
     """
-    X_processed = []
-    print(f"Preprocessing {len(X_raw)} audio samples...")
-    for i, audio in enumerate(X_raw):
-        # 1. Bandpass filter
-        filtered = apply_bandpass(audio, lowcut=20.0, highcut=1800.0, fs=4000)
-        # 2. Normalize
-        normalized = normalize_signal(filtered)
-        # 3. Generate Spectrogram
-        spec = generate_spectrogram(normalized, fs=4000)
-        
-        # Expand dims to add the channel dimension required by CNNs: (Height, Width) -> (Height, Width, 1)
-        spec = np.expand_dims(spec, axis=-1)
-        X_processed.append(spec)
-        
-    return np.array(X_processed)
+    def __init__(self, file_paths, labels, batch_size=32):
+        self.file_paths = file_paths
+        self.labels = labels
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return int(np.ceil(len(self.file_paths) / float(self.batch_size)))
+
+    def __getitem__(self, idx):
+        batch_x_paths = self.file_paths[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_y = self.labels[idx * self.batch_size:(idx + 1) * self.batch_size]
+
+        # Load the .npy files and add the CNN channel dimension
+        batch_x = []
+        for p in batch_x_paths:
+            spec = np.load(p)
+            spec = np.expand_dims(spec, axis=-1)
+            batch_x.append(spec)
+
+        return np.array(batch_x), np.array(batch_y)
 
 def build_cnn(input_shape):
     """Builds a lightweight CNN architecture suitable for spectrogram classification."""
@@ -50,45 +51,49 @@ def build_cnn(input_shape):
         layers.Dense(1, activation='sigmoid') # Binary classification (Normal vs Abnormal)
     ])
     
-    model.compile(optimizer='adam',
-                  loss='binary_crossentropy',
-                  metrics=['accuracy'])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
 if __name__ == "__main__":
-    print("--- Phase 2: Offline ML Verification ---")
+    print("--- Phase 2: Offline ML Training (Disk-Backed) ---")
     
-    # 1. Load Data
-    print("Generating synthetic audio dataset...")
-    X_raw, y = generate_mock_audio_dataset(num_samples=200, fs=4000, duration=3.0)
+    # 1. Gather all file paths
+    normal_files = glob.glob(os.path.join(PROCESSED_DIR, 'normal', '*.npy'))
+    abnormal_files = glob.glob(os.path.join(PROCESSED_DIR, 'abnormal', '*.npy'))
     
-    # 2. Preprocess Data (Enforcing DSP consistency)
-    X_features = preprocess_dataset(X_raw)
-    print(f"Feature shape after DSP: {X_features.shape}") # Should be (200, 128, 94, 1)
+    all_files = normal_files + abnormal_files
+    all_labels = [0]*len(normal_files) + [1]*len(abnormal_files)
     
-    # 3. Train/Test Split
-    X_train, X_test, y_train, y_test = train_test_split(X_features, y, test_size=0.2, random_state=42)
+    if len(all_files) == 0:
+        print("ERROR: No .npy files found. Did you run prepare_data.py first?")
+        exit(1)
+        
+    print(f"Found {len(all_files)} total preprocessed samples.")
     
-    # 4. Build Model
-    input_shape = X_train.shape[1:]
-    model = build_cnn(input_shape)
+    # 2. Train/Test Split
+    X_train_paths, X_test_paths, y_train, y_test = train_test_split(
+        all_files, all_labels, test_size=0.2, random_state=42, stratify=all_labels
+    )
+    
+    # 3. Create Generators
+    train_gen = AudioDataGenerator(X_train_paths, y_train, batch_size=32)
+    test_gen = AudioDataGenerator(X_test_paths, y_test, batch_size=32)
+    
+    # 4. Build Model (Determine shape from first file)
+    sample_shape = np.load(X_train_paths[0]).shape + (1,)
+    model = build_cnn(sample_shape)
     model.summary()
     
     # 5. Train Model
     print("Starting training loop...")
-    history = model.fit(
-        X_train, y_train,
+    model.fit(
+        train_gen,
         epochs=10,
-        batch_size=16,
-        validation_data=(X_test, y_test),
+        validation_data=test_gen,
         verbose=1
     )
     
-    # 6. Evaluate
-    loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
-    print(f"\nBaseline Validation Accuracy: {accuracy * 100:.2f}%")
-    
-    # 7. Save Artifact
+    # 6. Save Artifact
     model_dir = os.path.join(os.path.dirname(__file__), 'models')
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, 'classifier.h5')
