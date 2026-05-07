@@ -15,6 +15,7 @@ env/
 
 # Data / Logs
 logs/
+data/
 *.wav
 *.log
 
